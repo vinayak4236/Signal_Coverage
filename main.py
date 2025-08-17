@@ -12,16 +12,36 @@ from signal_model import (
     build_signal_map,
 )
 
-DATA_PATH   = Path("d:/PROJECTS/SCMP/data/sample_measurements.csv")
-OUTPUT_MAP  = Path("d:/PROJECTS/SCMP/signal_map.html")
+# ------------------------------------------------------------------
+# Paths (work both in dev and in the PyInstaller bundle)
+# ------------------------------------------------------------------
+BASE_DIR      = Path(__file__).resolve().parent
+DATA_PATH     = BASE_DIR / "data" / "sample_measurements.csv"
+OUTPUT_MAP    = BASE_DIR / "signal_map.html"
 
-COLORS = ["#d73027", "#fc8d59", "#fee08b", "#d9ef8b", "#91cf60", "#1a9850"]
-BINS   = [-120, -100, -90, -80, -70, -60, -40]
+# ------------------------------------------------------------------
+# Colour helpers
+# ------------------------------------------------------------------
+COLOUR_SCALE = ["#d73027", "#fc8d59", "#fee08b", "#91cf60", "#1a9850"]
+SIGNAL_VMIN, SIGNAL_VMAX = -110, -50   # fixed range for consistent colours
 
 def make_colormap():
-    return LinearColormap(colors=COLORS, vmin=BINS[0], vmax=BINS[-1],
-                          caption="Signal strength (dBm)")
+    return LinearColormap(
+        colors=COLOUR_SCALE,
+        vmin=SIGNAL_VMIN,
+        vmax=SIGNAL_VMAX,
+        caption="Signal strength (dBm)"
+    )
 
+def quality(signal: float) -> str:
+    if signal > -60:      return "Excellent"
+    elif signal > -75:    return "Good"
+    elif signal > -90:    return "Fair"
+    else:                 return "Poor"
+
+# ------------------------------------------------------------------
+# Browser GPS helper (unchanged)
+# ------------------------------------------------------------------
 def get_browser_location() -> tuple[float, float]:
     from http.server import HTTPServer, BaseHTTPRequestHandler
     import threading, urllib.parse
@@ -60,46 +80,52 @@ def get_browser_location() -> tuple[float, float]:
         httpd.serve_forever()
     return LocHandler.lat, LocHandler.lon
 
-
+# ------------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------------
 def main(model_type: str = "rf") -> None:
+    # 1. Load & train
     df = load_csv_dataset(str(DATA_PATH))
     print(f"Loaded {len(df)} samples")
     model = SignalStrengthModel(model_type=model_type)
     result = model.fit(df)
     print(f"Trained {result.model_type}  R²={result.r2:.2f}  MAE={result.mae:.2f}")
 
+    # 2. Get accurate location
     lat, lon = get_browser_location()
     print(f"Browser location: ({lat}, {lon})")
 
+    # 3. Predict grid
     grid = generate_prediction_grid(lat, lon, radius_m=2000, spacing_m=50)
     preds = model.predict(grid)
     grid["signal"] = preds
 
-    # Detect column names
     lat_col = next(c for c in grid.columns if c.lower() in {"lat", "latitude"})
     lon_col = next(c for c in grid.columns if c.lower() in {"lon", "lng", "longitude"})
     sig_col = "signal"
 
-    fmap = folium.Map(location=[lat, lon], zoom_start=14, tiles="OpenStreetMap")
-
-    # Heat map
-    heat_data = [[row[lat_col], row[lon_col], row[sig_col]] for _, row in grid.iterrows()]
-    HeatMap(heat_data, min_opacity=0.4, radius=25, blur=15).add_to(fmap)
-
-    # Colored circles
+    # 4. Build map
     cmap = make_colormap()
-    for _, row in grid.iterrows():
-        color = cmap(row[sig_col])
-        folium.CircleMarker(
-            location=[row[lat_col], row[lon_col]],
-            radius=4,
+    fmap = folium.Map(location=[lat, lon], zoom_start=14)
+
+    # 4a. Heat map (toggleable)
+    heat_data = [[row[lat_col], row[lon_col], row[sig_col]] for _, row in grid.iterrows()]
+    HeatMap(heat_data, min_opacity=0.4, radius=25, blur=15, name="Heatmap").add_to(fmap)
+
+    # 4b. Coloured circles with pop-ups
+    for _, r in grid.iterrows():
+        sig = r[sig_col]
+        folium.Circle(
+            location=[r[lat_col], r[lon_col]],
+            radius=25,
             color=None,
             fill=True,
-            fill_color=color,
-            fill_opacity=0.8,
+            fill_color=cmap(sig),
+            fill_opacity=0.7,
+            popup=f"Signal: {sig:.1f} dBm<br>Quality: {quality(sig)}"
         ).add_to(fmap)
 
-    # User marker & 2 km circle
+    # 4c. User marker & 2 km radius
     folium.Marker(
         location=[lat, lon],
         popup="You are here",
@@ -111,11 +137,14 @@ def main(model_type: str = "rf") -> None:
         color="#0078ff",
         weight=2,
         fill=False,
+        name="2 km radius"
     ).add_to(fmap)
 
+    # 4d. Legend & layer control
     cmap.add_to(fmap)
     folium.LayerControl().add_to(fmap)
 
+    # 5. Save & open
     fmap.save(str(OUTPUT_MAP))
     webbrowser.open(str(OUTPUT_MAP))
 
